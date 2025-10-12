@@ -19,6 +19,22 @@ def parse_version(version):
         (?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)   # version, e.g. 1.2.33
         (?P<prerelease>(?P<ptype>a|b|rc)(?P<pnum>\d+))?  # optional prerelease, e.g. a1 or b2 or rc33
     """
+    # Handle development versions like "0.1.dev9303+g02cc8f877.d20251012"
+    if ".dev" in version:
+        # Extract the base version before .dev
+        base_version = version.split(".dev")[0]
+        # Split base version into parts
+        parts = base_version.split(".")
+        if len(parts) == 2:
+            # If we only have major.minor, add patch as 0
+            parts.append("0")
+        elif len(parts) < 2:
+            # If we don't have enough parts, pad with zeros
+            while len(parts) < 3:
+                parts.append("0")
+        # Return development version tuple
+        return (int(parts[0]), int(parts[1]), int(parts[2]), -5, 0)  # -5 for dev versions
+    
     m = re.match(version_re, version, re.VERBOSE)
     if m is None:
         raise ValueError("Invalid version string %s" % version)

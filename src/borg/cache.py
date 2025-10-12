@@ -18,7 +18,7 @@ files_cache_logger = create_logger("borg.debug.files_cache")
 
 from borgstore.store import ItemInfo
 
-from .constants import CACHE_README, FILES_CACHE_MODE_DISABLED, ROBJ_FILE_STREAM, TIME_DIFFERS2_NS
+from .constants import CACHE_README, FILES_CACHE_MODE_DISABLED, MAX_OBJECT_SIZE, ROBJ_FILE_STREAM, TIME_DIFFERS2_NS
 from .checksums import xxh64
 from .hashindex import ChunkIndex, ChunkIndexEntry
 from .helpers import Error
@@ -710,8 +710,17 @@ def list_chunkindex_hashes(repository):
     for info in repository.store_list("cache"):
         info = ItemInfo(*info)  # RPC does not give namedtuple
         if info.name.startswith("chunks."):
-            hash = info.name.removeprefix("chunks.")
-            hashes.append(hash)
+            if info.name.startswith("chunks.chunked."):
+                # Chunked cache manifest
+                hash = f"chunked.{info.name.removeprefix('chunks.chunked.')}"
+                hashes.append(hash)
+            elif info.name.startswith("chunks.data."):
+                # Data chunks are handled via their manifests, skip individual chunks
+                continue
+            else:
+                # Regular single chunk cache
+                hash = info.name.removeprefix("chunks.")
+                hashes.append(hash)
     hashes = sorted(hashes)
     logger.debug(f"cached chunk indexes: {hashes}")
     return hashes
@@ -720,12 +729,17 @@ def list_chunkindex_hashes(repository):
 def delete_chunkindex_cache(repository):
     hashes = list_chunkindex_hashes(repository)
     for hash in hashes:
-        cache_name = f"cache/chunks.{hash}"
-        try:
-            repository.store_delete(cache_name)
-        except (Repository.ObjectNotFound, StoreObjectNotFound):
-            # TODO: ^ seem like RemoteRepository raises Repository.ONF instead of StoreONF
-            pass
+        if hash.startswith("chunked."):
+            # Delete chunked cache (manifest + all data chunks)
+            _delete_chunked_cache(repository, hash.removeprefix("chunked."))
+        else:
+            # Delete regular cache
+            cache_name = f"cache/chunks.{hash}"
+            try:
+                repository.store_delete(cache_name)
+            except (Repository.ObjectNotFound, StoreObjectNotFound):
+                # TODO: ^ seem like RemoteRepository raises Repository.ONF instead of StoreONF
+                pass
     logger.debug(f"cached chunk indexes deleted: {hashes}")
 
 
@@ -746,14 +760,26 @@ def write_chunkindex_to_repo_cache(
     # but for simplicity, we do it anyway.
     for key, _ in chunks.iteritems(only_new=incremental):
         chunks_to_write[key] = cleaned_value
+    
+    # Serialize the chunk index data
     with io.BytesIO() as f:
         chunks_to_write.write(f)
         data = f.getvalue()
+    
     logger.debug(f"caching {len(chunks_to_write)} chunks (incremental={incremental}).")
     chunks_to_write.clear()  # free memory of the temporary table
     if clear:
         # if we don't need the in-memory chunks index anymore:
         chunks.clear()  # free memory, immediately
+    
+    # Check if data exceeds MAX_OBJECT_SIZE and split if necessary
+    if len(data) > MAX_OBJECT_SIZE:
+        return _write_chunked_chunkindex_to_repo_cache(
+            repository, data, cached_hashes=list_chunkindex_hashes(repository),
+            force_write=force_write, delete_other=delete_other, delete_these=delete_these
+        )
+    
+    # Original single-object logic for smaller data
     new_hash = bin_to_hex(xxh64(data, seed=CHUNKINDEX_HASH_SEED))
     cached_hashes = list_chunkindex_hashes(repository)
     if force_write or new_hash not in cached_hashes:
@@ -789,6 +815,11 @@ def write_chunkindex_to_repo_cache(
 
 
 def read_chunkindex_from_repo_cache(repository, hash):
+    if hash.startswith("chunked."):
+        # Handle chunked cache
+        return _read_chunked_chunkindex_from_repo_cache(repository, hash.removeprefix("chunked."))
+    
+    # Handle regular single-object cache
     cache_name = f"cache/chunks.{hash}"
     logger.debug(f"trying to load {cache_name} from the repo...")
     try:
@@ -918,6 +949,7 @@ class ChunksMixin:
         if exists:
             # if borg create is processing lots of unchanged files (no content and not metadata changes),
             # there could be a long time without any repository operations and the repo lock would get stale.
+            # refreshing the lock is not part of the repository API, so we do it indirectly via repository.info.
             self.refresh_lock(now)
             return self.reuse_chunk(id, size, stats)
         cdata = self.repo_objs.format(
@@ -1071,3 +1103,219 @@ class AdHocWithFilesCache(FilesCacheMixin, ChunksMixin):
 
         self.cache_config.ignored_features.update(repo_features - my_features)
         self.cache_config.mandatory_features.update(repo_features & my_features)
+
+
+# Helper functions for chunked ChunkIndex cache management
+
+def _write_chunked_chunkindex_to_repo_cache(
+    repository, data, *, cached_hashes, force_write=False, delete_other=False, delete_these=None
+):
+    """
+    Write large ChunkIndex data by splitting it into smaller chunks that fit within MAX_OBJECT_SIZE.
+    Maintains integrity by using a manifest chunk that references all data chunks.
+    
+    :param repository: The repository to store chunks in
+    :param data: The serialized ChunkIndex data to split and store
+    :param cached_hashes: List of existing cached chunk hashes
+    :param force_write: Force writing even if hash already exists
+    :param delete_other: Delete other cached indexes after writing
+    :param delete_these: Specific cached indexes to delete
+    :return: The main hash of the chunked data
+    """
+    # Calculate chunk size, leaving some overhead for metadata
+    chunk_size = MAX_OBJECT_SIZE - 1024  # Reserve space for manifest overhead
+    
+    # Split data into chunks
+    data_chunks = []
+    data_chunk_hashes = []
+    
+    offset = 0
+    chunk_index = 0
+    while offset < len(data):
+        chunk_data = data[offset:offset + chunk_size]
+        chunk_hash = bin_to_hex(xxh64(chunk_data, seed=CHUNKINDEX_HASH_SEED))
+        
+        data_chunks.append((chunk_hash, chunk_data))
+        data_chunk_hashes.append(chunk_hash)
+        
+        offset += chunk_size
+        chunk_index += 1
+    
+    # Create manifest containing metadata about the chunks
+    manifest = {
+        'version': 1,
+        'total_size': len(data),
+        'chunk_size': chunk_size,
+        'chunk_count': len(data_chunks),
+        'chunk_hashes': data_chunk_hashes,
+        'original_hash': bin_to_hex(xxh64(data, seed=CHUNKINDEX_HASH_SEED))
+    }
+    
+    # Serialize manifest
+    manifest_data = msgpack.packb(manifest)
+    manifest_hash = bin_to_hex(xxh64(manifest_data, seed=CHUNKINDEX_HASH_SEED))
+    
+    # Check if we already have this chunked data cached
+    manifest_cache_name = f"cache/chunks.chunked.{manifest_hash}"
+    if not force_write and manifest_hash in cached_hashes:
+        logger.debug(f"chunked cache {manifest_cache_name} already exists, skipping write")
+        return f"chunked.{manifest_hash}"
+    
+    logger.debug(f"caching large chunks index as {len(data_chunks)} chunks + manifest {manifest_cache_name}")
+    
+    # Store all data chunks first
+    stored_chunk_names = []
+    for chunk_hash, chunk_data in data_chunks:
+        chunk_cache_name = f"cache/chunks.data.{chunk_hash}"
+        try:
+            repository.store_store(chunk_cache_name, chunk_data)
+            stored_chunk_names.append(chunk_cache_name)
+            logger.debug(f"stored chunk {chunk_cache_name} ({len(chunk_data)} bytes)")
+        except Exception as e:
+            # Cleanup already stored chunks on failure
+            logger.error(f"failed to store chunk {chunk_cache_name}: {e}")
+            for cleanup_name in stored_chunk_names:
+                try:
+                    repository.store_delete(cleanup_name)
+                except Exception:
+                    pass  # Best effort cleanup
+            raise
+
+    # Store manifest last (indicates successful storage of all chunks)
+    try:
+        repository.store_store(manifest_cache_name, manifest_data)
+        logger.debug(f"stored manifest {manifest_cache_name} ({len(manifest_data)} bytes)")
+    except Exception as e:
+        # Cleanup all stored chunks on manifest storage failure
+        logger.error(f"failed to store manifest {manifest_cache_name}: {e}")
+        for cleanup_name in stored_chunk_names:
+            try:
+                repository.store_delete(cleanup_name)
+            except Exception:
+                pass  # Best effort cleanup
+        raise
+
+    # Handle cleanup of old cached indexes
+    if delete_other:
+        delete_these = set(cached_hashes) - {f"chunked.{manifest_hash}"}
+    elif delete_these:
+        delete_these = set(delete_these) - {f"chunked.{manifest_hash}"}
+    else:
+        delete_these = set()
+
+    for hash_to_delete in delete_these:
+        if hash_to_delete.startswith("chunked."):
+            # Delete chunked cache (manifest + all data chunks)
+            _delete_chunked_cache(repository, hash_to_delete.removeprefix("chunked."))
+        else:
+            # Delete regular cache
+            cache_name = f"cache/chunks.{hash_to_delete}"
+            try:
+                repository.store_delete(cache_name)
+            except (Repository.ObjectNotFound, StoreObjectNotFound):
+                pass
+
+    if delete_these:
+        logger.debug(f"cached chunk indexes deleted: {delete_these}")
+
+    return f"chunked.{manifest_hash}"
+
+
+def _delete_chunked_cache(repository, manifest_hash):
+    """Delete a chunked cache including manifest and all data chunks."""
+    manifest_cache_name = f"cache/chunks.chunked.{manifest_hash}"
+    try:
+        # Load manifest to get chunk information
+        manifest_data = repository.store_load(manifest_cache_name)
+        manifest = msgpack.unpackb(manifest_data)
+        
+        # Delete all data chunks
+        for chunk_hash in manifest['chunk_hashes']:
+            chunk_cache_name = f"cache/chunks.data.{chunk_hash}"
+            try:
+                repository.store_delete(chunk_cache_name)
+            except (Repository.ObjectNotFound, StoreObjectNotFound):
+                pass  # Chunk might have been deleted already or never existed
+        
+        # Delete manifest
+        repository.store_delete(manifest_cache_name)
+        logger.debug(f"deleted chunked cache {manifest_cache_name} with {len(manifest['chunk_hashes'])} chunks")
+        
+    except (Repository.ObjectNotFound, StoreObjectNotFound):
+        # Manifest doesn't exist, nothing to clean up
+        pass
+    except Exception as e:
+        logger.warning(f"failed to fully delete chunked cache {manifest_cache_name}: {e}")
+
+
+def _read_chunked_chunkindex_from_repo_cache(repository, manifest_hash):
+    """Read a chunked ChunkIndex cache by loading manifest and reassembling data chunks."""
+    manifest_cache_name = f"cache/chunks.chunked.{manifest_hash}"
+    logger.debug(f"trying to load chunked cache {manifest_cache_name} from the repo...")
+    
+    try:
+        # Load manifest
+        manifest_data = repository.store_load(manifest_cache_name)
+        manifest = msgpack.unpackb(manifest_data)
+        
+        # Validate manifest structure
+        if manifest.get('version') != 1:
+            logger.debug(f"unsupported chunked cache version: {manifest.get('version')}")
+            return None
+            
+        # Verify manifest integrity
+        if xxh64(manifest_data, seed=CHUNKINDEX_HASH_SEED) != hex_to_bin(manifest_hash):
+            logger.debug(f"chunked cache manifest {manifest_cache_name} is corrupted")
+            return None
+        
+        logger.debug(f"loading chunked cache with {manifest['chunk_count']} chunks, total size {manifest['total_size']}")
+        
+        # Load and reassemble data chunks
+        reassembled_data = bytearray(manifest['total_size'])
+        offset = 0
+        
+        for chunk_hash in manifest['chunk_hashes']:
+            chunk_cache_name = f"cache/chunks.data.{chunk_hash}"
+            try:
+                chunk_data = repository.store_load(chunk_cache_name)
+                
+                # Verify chunk integrity
+                if xxh64(chunk_data, seed=CHUNKINDEX_HASH_SEED) != hex_to_bin(chunk_hash):
+                    logger.debug(f"chunk {chunk_cache_name} is corrupted")
+                    return None
+                
+                # Copy chunk data to reassembled buffer
+                end_offset = offset + len(chunk_data)
+                if end_offset > len(reassembled_data):
+                    logger.debug(f"chunk {chunk_cache_name} extends beyond expected total size")
+                    return None
+                    
+                reassembled_data[offset:end_offset] = chunk_data
+                offset = end_offset
+                
+            except (Repository.ObjectNotFound, StoreObjectNotFound):
+                logger.debug(f"chunk {chunk_cache_name} not found in repository")
+                return None
+        
+        # Verify final reassembled data integrity
+        if offset != manifest['total_size']:
+            logger.debug(f"reassembled data size mismatch: expected {manifest['total_size']}, got {offset}")
+            return None
+            
+        reassembled_bytes = bytes(reassembled_data)
+        if xxh64(reassembled_bytes, seed=CHUNKINDEX_HASH_SEED) != hex_to_bin(manifest['original_hash']):
+            logger.debug(f"reassembled data integrity check failed")
+            return None
+        
+        # Parse the ChunkIndex from reassembled data
+        logger.debug(f"chunked cache {manifest_cache_name} is valid, parsing ChunkIndex...")
+        with io.BytesIO(reassembled_bytes) as f:
+            chunks = ChunkIndex.read(f)
+        return chunks
+        
+    except (Repository.ObjectNotFound, StoreObjectNotFound):
+        logger.debug(f"chunked cache manifest {manifest_cache_name} not found in repository")
+        return None
+    except Exception as e:
+        logger.debug(f"failed to load chunked cache {manifest_cache_name}: {e}")
+        return None

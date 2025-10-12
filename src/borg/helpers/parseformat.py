@@ -304,7 +304,7 @@ def _replace_placeholders(text, overrides={}):
         "borgversion": borg_version,
         "borgmajor": "%d" % borg_version_tuple[:1],
         "borgminor": "%d.%d" % borg_version_tuple[:2],
-        "borgpatch": "%d.%d.%d" % borg_version_tuple[:3],
+        "borgpatch": "%d.%d.%d" % (borg_version_tuple + (0, 0))[:3],
         **overrides,
     }
     return format_line(text, data)
