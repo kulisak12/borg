@@ -218,12 +218,12 @@ def get_limited_unpacker(kind):
     #       unpack(data) or from max_buffer_size for Unpacker(max_buffer_size=N).
     args = dict(use_list=False, max_buffer_size=3 * max(BUFSIZE, MAX_OBJECT_SIZE))  # return tuples, not lists
     if kind in ("server", "client"):
-        pass
-        args.update(dict(max_buffer_size=300000))
-        # # Set buffer size to accommodate the largest possible repository object
-        # # MAX_OBJECT_SIZE (~20MB) plus overhead for msgpack protocol and RPC wrapping
-        # # We use 3x MAX_OBJECT_SIZE to provide safety margin for protocol overhead
-        # args.update(dict(max_buffer_size=3 * MAX_OBJECT_SIZE))
+        # pass
+        # args.update(dict(max_buffer_size=300000))
+        # Set buffer size to accommodate the largest possible repository object
+        # MAX_OBJECT_SIZE (~20MB) plus overhead for msgpack protocol and RPC wrapping
+        # We use 3x MAX_OBJECT_SIZE to provide safety margin for protocol overhead
+        args.update(dict(max_buffer_size=3 * MAX_OBJECT_SIZE))
     elif kind in ("manifest", "archive", "key"):
         args.update(dict(use_list=True, object_hook=StableDict))  # default value
     else:
