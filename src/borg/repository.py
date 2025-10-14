@@ -1,7 +1,7 @@
 import builtins
 import os
 import time
-from typing import Callable, Iterable, Iterator
+from typing import Callable, Iterable, Iterator, TYPE_CHECKING
 
 from borgstore.store import ItemInfo, Store
 from borgstore.store import ObjectNotFound as StoreObjectNotFound
@@ -20,10 +20,15 @@ from .logger import create_logger
 from .manifest import NoManifestError
 from .repoobj import RepoObj
 
+if TYPE_CHECKING:
+    from .remote import RemoteRepository
+
 logger = create_logger(__name__)
 
 
-def repo_lister(repository: "Repository", *, limit: int | None = None) -> Iterator[tuple[bytes, int]]:
+def repo_lister(
+    repository: "Repository" | RemoteRepository, *, limit: int | None = None
+) -> Iterator[tuple[bytes, int]]:
     marker = None
     finished = False
     while not finished:
