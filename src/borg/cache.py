@@ -828,6 +828,11 @@ def write_chunkindex_to_repo_cache(
 
 
 def read_chunkindex_from_repo_cache(repository: Repository | RemoteRepository, hash: str) -> ChunkIndex | None:
+    if hash.startswith("chunked."):
+        # Handle chunked cache
+        return _read_chunked_chunkindex_from_repo_cache(repository, hash.removeprefix("chunked."))
+    
+    # Handle regular single-object cache
     cache_name = f"cache/chunks.{hash}"
     logger.debug(f"trying to load {cache_name} from the repo...")
     try:
@@ -1261,7 +1266,7 @@ def _delete_chunked_cache(repository, manifest_hash):
         logger.warning(f"failed to fully delete chunked cache {manifest_cache_name}: {e}")
 
 
-def _read_chunked_chunkindex_from_repo_cache(repository, manifest_hash):
+def _read_chunked_chunkindex_from_repo_cache(repository: Repository | RemoteRepository, manifest_hash: str) -> ChunkIndex | None:
     """Read a chunked ChunkIndex cache by loading manifest and reassembling data chunks."""
     manifest_cache_name = f"cache/chunks.chunked.{manifest_hash}"
     logger.debug(f"trying to load chunked cache {manifest_cache_name} from the repo...")
