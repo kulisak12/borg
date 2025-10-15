@@ -23,7 +23,7 @@ from .repoobj import RepoObj
 logger = create_logger(__name__)
 
 
-def repo_lister(repository: "Repository", *, limit: int | None = None) -> Iterator[tuple[bytes, int]]:
+def repo_lister(repository, *, limit: int | None = None) -> Iterator[tuple[bytes, int]]:
     marker = None
     finished = False
     while not finished:
