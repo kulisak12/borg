@@ -823,6 +823,8 @@ Duration: {0.duration}
                 return  # done! we already have fully extracted this file in a previous run.
             elif stat.S_ISDIR(st.st_mode):
                 os.rmdir(path)
+            elif continue_extraction:
+                pass  # we will continue extracting the incomplete file below
             else:
                 os.unlink(path)
         except UnicodeEncodeError:
@@ -835,6 +837,23 @@ Duration: {0.duration}
             if not os.path.exists(parent_dir):
                 os.makedirs(parent_dir)
 
+        def skip_existing_chunks(fd, chunks):
+            """
+            Skip over chunks already present in the file.
+            Seek fd to the end of existing data, return remaining chunks to write.
+            """
+            size = os.fstat(fd.fileno()).st_size
+            skipped_size = 0
+            skipped_count = 0
+            for chunk in chunks:
+                if skipped_size + chunk.size <= size:
+                    skipped_size += chunk.size
+                    skipped_count += 1
+                else:
+                    break
+            fd.seek(skipped_size)
+            return chunks[skipped_count:]
+
         mode = item.mode
         if stat.S_ISREG(mode):
             with backup_io("makedirs"):
@@ -843,9 +862,16 @@ Duration: {0.duration}
                 if hardlink_set:
                     return
                 with backup_io("open"):
-                    fd = open(path, "wb")
+                    try:
+                        # we want to keep existing content for continue_extraction
+                        fd = open(path, "r+b")
+                    except FileNotFoundError:
+                        fd = open(path, "wb")
                 with fd:
-                    for data in self.pipeline.fetch_many(item.chunks, is_preloaded=True, ro_type=ROBJ_FILE_STREAM):
+                    chunks = item.chunks
+                    if continue_extraction:
+                        chunks = skip_existing_chunks(fd, chunks)
+                    for data in self.pipeline.fetch_many(chunks, is_preloaded=True, ro_type=ROBJ_FILE_STREAM):
                         if pi:
                             pi.show(increase=len(data), info=[remove_surrogates(item.path)])
                         with backup_io("write"):
